@@ -1,408 +1,329 @@
-from flask import Flask, render_template_string, request, send_file, jsonify
-import io
-import re
-import json
-import urllib.request
-import urllib.error
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
+import os
+import tempfile
+import shutil
+import threading
+from flask import Flask, request, send_file, render_template_string, jsonify
+import yt_dlp
 
 app = Flask(__name__)
 
-# --- Configuration ---
-apiKey = "" 
+# Global storage for progress tracking
+download_progress = {}
 
-# --- UI Templates (Tailwind CSS based with RED TIGER Branding) ---
-NAV_HTML = """
-<nav class="bg-white border-b border-gray-200 sticky top-0 z-50">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div class="flex justify-between h-16 items-center">
-            <div class="flex items-center gap-2">
-                <span class="text-2xl text-red-600 font-bold">🐅</span>
-                <span class="text-xl font-black tracking-tighter bg-gradient-to-r from-red-600 via-orange-500 to-black bg-clip-text text-transparent">
-                    RED TIGER WORKSPACE
-                </span>
-            </div>
-            <div class="flex items-center gap-6">
-                <a href="/" class="text-sm font-medium text-gray-600 hover:text-red-600 transition">Dashboard</a>
-                <a href="/word" class="text-sm font-medium text-gray-600 hover:text-red-600 transition">Word</a>
-                <a href="/sheet" class="text-sm font-medium text-gray-600 hover:text-red-600 transition">Sheet</a>
-            </div>
-        </div>
-    </div>
-</nav>
-"""
-
-# ---------------- API ROUTES ----------------
-
-@app.route("/api/ai", methods=["POST"])
-def ai_assistant():
-    """Gemini AI Assistant using built-in urllib"""
-    data = request.json
-    prompt = data.get("prompt", "")
-    content = data.get("content", "")
-    full_prompt = f"{prompt}: \n\n {content}"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
-    
-    payload = {
-        "contents": [{"parts": [{"text": full_prompt}]}],
-        "systemInstruction": {"parts": [{"text": "You are a professional writing assistant for RED TIGER WORKSPACE. Provide sharp, accurate, and creative edits."}]}
-    }
-    
-    try:
-        req = urllib.request.Request(url, method="POST")
-        req.add_header('Content-Type', 'application/json')
-        body = json.dumps(payload).encode('utf-8')
-        with urllib.request.urlopen(req, data=body) as response:
-            result = json.loads(response.read().decode('utf-8'))
-        text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', 'No response from AI.')
-        return jsonify({"result": text})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------------- PAGE ROUTES ----------------
-
-@app.route("/")
-def home():
-    return render_template_string(f"""
+# Modern UI with Glassmorphism, Progress Bar, and Enhanced UX
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RED TIGER WORKSPACE - Dashboard</title>
+    <title>StreamVault | Premium YT Downloader</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
-    <style>body {{ font-family: 'Inter', sans-serif; background: #fafafa; }}</style>
-</head>
-<body>
-    {NAV_HTML}
-    <main class="max-w-7xl mx-auto px-4 py-16">
-        <div class="text-center mb-16">
-            <h1 class="text-5xl font-black text-gray-900 mb-4 tracking-tight">RED TIGER <span class="text-red-600">OFFICE</span></h1>
-            <p class="text-lg text-gray-500 max-w-2xl mx-auto">Ultimate power workspace for the modern professional. Create, calculate, and innovate with AI.</p>
-        </div>
-        
-        <div class="grid md:grid-cols-2 gap-10 max-w-4xl mx-auto">
-            <div class="bg-white p-10 rounded-3xl shadow-sm border border-gray-100 hover:border-red-200 transition-all group">
-                <div class="w-16 h-16 bg-red-50 text-red-600 rounded-2xl flex items-center justify-center mb-6 text-3xl group-hover:scale-110 transition">📝</div>
-                <h3 class="text-2xl font-bold mb-2">Tiger Word</h3>
-                <p class="text-gray-500 mb-8">AI-powered editor with professional formatting and export features.</p>
-                <a href="/word" class="block text-center bg-gray-900 text-white px-8 py-4 rounded-2xl font-bold hover:bg-red-600 transition shadow-lg shadow-gray-200">Launch Editor</a>
-            </div>
-
-            <div class="bg-white p-10 rounded-3xl shadow-sm border border-gray-100 hover:border-red-200 transition-all group">
-                <div class="w-16 h-16 bg-orange-50 text-orange-600 rounded-2xl flex items-center justify-center mb-6 text-3xl group-hover:scale-110 transition">📊</div>
-                <h3 class="text-2xl font-bold mb-2">Tiger Sheet</h3>
-                <p class="text-gray-500 mb-8">Fast, reactive spreadsheet for complex data and analytics.</p>
-                <a href="/sheet" class="block text-center bg-gray-900 text-white px-8 py-4 rounded-2xl font-bold hover:bg-red-600 transition shadow-lg shadow-gray-200">Launch Sheet</a>
-            </div>
-        </div>
-    </main>
-</body>
-</html>
-""")
-
-@app.route("/word")
-def word():
-    return render_template_string(f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Tiger Word - RED TIGER</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
-        #editor {{ min-height: 297mm; width: 210mm; }}
+        body { font-family: 'Inter', sans-serif; background: radial-gradient(circle at top right, #1e1b4b, #000000); }
+        .glass {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .loader-ring {
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            border-top: 3px solid #6366f1;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        .progress-container {
+            width: 100%;
+            background-color: rgba(255, 255, 255, 0.05);
+            border-radius: 999px;
+            overflow: hidden;
+            height: 10px;
+        }
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #6366f1, #22d3ee);
+            width: 0%;
+            transition: width 0.4s ease;
+        }
     </style>
 </head>
-<body class="bg-gray-100 min-h-screen">
-    {NAV_HTML}
-    
-    <div class="bg-white border-b border-gray-200 py-3 sticky top-16 z-40 shadow-sm">
-        <div class="max-w-7xl mx-auto px-4 flex gap-4 items-center flex-wrap">
-            <div class="flex bg-gray-50 p-1.5 rounded-xl border border-gray-100">
-                <button onclick="cmd('bold')" class="px-3 py-1 hover:bg-white rounded-lg transition font-bold">B</button>
-                <button onclick="cmd('italic')" class="px-3 py-1 hover:bg-white rounded-lg transition italic">I</button>
-                <button onclick="cmd('underline')" class="px-3 py-1 hover:bg-white rounded-lg transition underline">U</button>
+<body class="text-slate-200 min-h-screen flex items-center justify-center p-6">
+    <div class="max-w-xl w-full">
+        <!-- Header -->
+        <div class="text-center mb-10">
+            <h1 class="text-5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400 mb-2">
+                StreamVault
+            </h1>
+            <p class="text-slate-400 text-lg">Download crystal clear audio in seconds</p>
+        </div>
+
+        <!-- Main Card -->
+        <div class="glass rounded-3xl p-8 shadow-2xl relative overflow-hidden">
+            <div class="relative z-10">
+                <div class="space-y-6">
+                    <div>
+                        <label class="block text-sm font-semibold text-slate-400 mb-2 ml-1">YouTube URL</label>
+                        <div class="flex flex-col sm:flex-row gap-3">
+                            <input 
+                                type="url" id="videoUrl" 
+                                placeholder="Paste link here..." 
+                                class="flex-1 bg-black/40 border border-white/10 rounded-2xl px-5 py-4 focus:ring-2 focus:ring-indigo-500 focus:outline-none transition-all placeholder:text-slate-600"
+                            >
+                            <button 
+                                onclick="analyzeVideo()" 
+                                id="analyzeBtn"
+                                class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-4 px-8 rounded-2xl transition-all shadow-lg shadow-indigo-500/20 active:scale-95 flex items-center justify-center min-w-[120px]"
+                            >
+                                <span id="analyzeText">Analyze</span>
+                                <div id="analyzeLoader" class="loader-ring hidden"></div>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Video Preview Area -->
+                    <div id="previewArea" class="hidden animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <div class="bg-black/20 rounded-2xl p-4 border border-white/5 flex flex-col gap-4">
+                            <div class="flex gap-4 items-center">
+                                <img id="videoThumb" src="" class="w-20 h-20 rounded-xl object-cover shadow-lg border border-white/10">
+                                <div class="flex-1 min-w-0">
+                                    <h3 id="videoTitle" class="font-bold text-white truncate text-base"></h3>
+                                    <p id="videoDuration" class="text-slate-400 text-xs mt-1"></p>
+                                    <button 
+                                        onclick="startDownload()" 
+                                        id="downloadActionBtn"
+                                        class="mt-2 bg-white/5 hover:bg-white/10 border border-white/10 text-indigo-400 hover:text-indigo-300 px-4 py-2 rounded-lg font-bold text-xs transition-all flex items-center gap-2 group"
+                                    >
+                                        Confirm Download 
+                                        <span class="group-hover:translate-x-1 transition-transform">→</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Progress UI -->
+                            <div id="progressUI" class="hidden space-y-2 mt-2 pt-4 border-t border-white/5">
+                                <div class="flex justify-between text-xs font-semibold">
+                                    <span id="progressStatus" class="text-slate-400 italic">Preparing...</span>
+                                    <span id="progressPercent" class="text-indigo-400">0%</span>
+                                </div>
+                                <div class="progress-container">
+                                    <div id="progressBar" class="progress-bar"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Status Messages -->
+                    <div id="statusMsg" class="hidden text-center py-3 px-4 rounded-xl text-sm"></div>
+                </div>
             </div>
+        </div>
+
+        <!-- Features Footer -->
+        <div class="grid grid-cols-3 gap-4 mt-8">
+            <div class="glass p-4 rounded-2xl text-center">
+                <div class="text-indigo-400 mb-1">⚡</div>
+                <div class="text-[10px] font-bold uppercase tracking-widest text-slate-500">Fast</div>
+            </div>
+            <div class="glass p-4 rounded-2xl text-center">
+                <div class="text-cyan-400 mb-1">🎧</div>
+                <div class="text-[10px] font-bold uppercase tracking-widest text-slate-500">M4A Format</div>
+            </div>
+            <div class="glass p-4 rounded-2xl text-center">
+                <div class="text-rose-400 mb-1">🛡️</div>
+                <div class="text-[10px] font-bold uppercase tracking-widest text-slate-500">Secure</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentTaskId = null;
+        let progressInterval = null;
+
+        async function analyzeVideo() {
+            const url = document.getElementById('videoUrl').value;
+            const btn = document.getElementById('analyzeBtn');
+            const btnText = document.getElementById('analyzeText');
+            const loader = document.getElementById('analyzeLoader');
+            const preview = document.getElementById('previewArea');
+            const status = document.getElementById('statusMsg');
+            const progressUI = document.getElementById('progressUI');
+
+            if (!url) return;
+
+            status.classList.add('hidden');
+            progressUI.classList.add('hidden');
+            btn.disabled = true;
+            btnText.classList.add('hidden');
+            loader.classList.remove('hidden');
+
+            try {
+                const response = await fetch('/info', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                
+                const data = await response.json();
+                if (data.error) throw new Error(data.error);
+
+                document.getElementById('videoThumb').src = data.thumbnail;
+                document.getElementById('videoTitle').innerText = data.title;
+                document.getElementById('videoDuration').innerText = "Duration: " + data.duration;
+                currentTaskId = data.task_id;
+                
+                preview.classList.remove('hidden');
+                document.getElementById('downloadActionBtn').disabled = false;
+                document.getElementById('downloadActionBtn').classList.remove('opacity-50');
+            } catch (e) {
+                status.innerText = "Error: " + e.message;
+                status.classList.remove('hidden');
+                status.classList.add('bg-rose-500/10', 'text-rose-400');
+            } finally {
+                btn.disabled = false;
+                btnText.classList.remove('hidden');
+                loader.classList.add('hidden');
+            }
+        }
+
+        function startDownload() {
+            const url = document.getElementById('videoUrl').value;
+            const progressUI = document.getElementById('progressUI');
+            const actionBtn = document.getElementById('downloadActionBtn');
+            const statusText = document.getElementById('progressStatus');
             
-            <div class="flex items-center gap-2 bg-gray-50 p-1.5 rounded-xl border border-gray-100">
-                <label class="text-[10px] uppercase font-bold text-gray-400 ml-1">Color</label>
-                <input type="color" onchange="cmd('foreColor', this.value)" class="w-7 h-7 p-0 border-none cursor-pointer bg-transparent">
-            </div>
+            progressUI.classList.remove('hidden');
+            actionBtn.disabled = true;
+            actionBtn.classList.add('opacity-50');
+            statusText.innerText = "Downloading...";
 
-            <select onchange="cmd('fontSize', this.value)" class="border border-gray-100 bg-gray-50 rounded-xl px-3 py-1.5 outline-none text-sm font-medium">
-                <option value="3">Small</option><option value="4" selected>Normal</option>
-                <option value="5">Large</option><option value="6">Heading</option>
-            </select>
+            if (progressInterval) clearInterval(progressInterval);
+            progressInterval = setInterval(updateProgress, 1000);
 
-            <div class="h-6 w-px bg-gray-200"></div>
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/download';
+            
+            const inputUrl = document.createElement('input');
+            inputUrl.type = 'hidden'; inputUrl.name = 'url'; inputUrl.value = url;
+            form.appendChild(inputUrl);
 
-            <button onclick="askAI('Rewrite this text professionally')" class="bg-red-50 text-red-700 px-4 py-1.5 rounded-xl border border-red-100 text-sm font-bold hover:bg-red-100 transition flex items-center gap-2">✨ Rewrite</button>
-            <button onclick="askAI('Summarize this text into bullet points')" class="bg-gray-50 text-gray-700 px-4 py-1.5 rounded-xl border border-gray-100 text-sm font-bold hover:bg-gray-200 transition">📝 Summary</button>
+            const inputId = document.createElement('input');
+            inputId.type = 'hidden'; inputId.name = 'task_id'; inputId.value = currentTaskId;
+            form.appendChild(inputId);
+            
+            document.body.appendChild(form);
+            form.submit();
+            document.body.removeChild(form);
+        }
 
-            <div class="flex-grow"></div>
-            <button onclick="exportPDF()" class="bg-red-600 text-white px-6 py-2 rounded-xl hover:bg-red-700 shadow-md shadow-red-100 text-sm font-bold transition">Export PDF</button>
-        </div>
-    </div>
+        async function updateProgress() {
+            if (!currentTaskId) return;
 
-    <div class="max-w-7xl mx-auto px-4 py-12 flex justify-center">
-        <div id="editor" contenteditable="true" class="bg-white shadow-2xl p-24 outline-none leading-relaxed text-gray-800 text-lg border border-gray-100 rounded-sm">
-            Welcome to <b>RED TIGER WORKSPACE</b>. Start writing...
-        </div>
-    </div>
-
-    <div id="loading" class="fixed inset-0 bg-black/20 hidden flex items-center justify-center z-50 backdrop-blur-sm">
-        <div class="bg-white p-8 rounded-3xl shadow-2xl flex flex-col items-center gap-4">
-            <div class="animate-spin rounded-full h-10 w-10 border-4 border-red-600 border-t-transparent"></div>
-            <span class="font-bold text-gray-800">TIGER AI IS THINKING...</span>
-        </div>
-    </div>
-
-    <script>
-        const editor = document.getElementById("editor");
-        const loading = document.getElementById("loading");
-
-        editor.innerHTML = localStorage.getItem("tiger_word") || "Welcome to <b>RED TIGER WORKSPACE</b>. Start writing...";
-
-        function cmd(n, v=null) {{ document.execCommand(n, false, v); save(); }}
-        function save() {{ localStorage.setItem("tiger_word", editor.innerHTML); }}
-        editor.oninput = save;
-
-        async function askAI(prompt) {{
-            const selectedText = window.getSelection().toString() || editor.innerText;
-            if(!selectedText.trim()) return;
-            loading.classList.remove('hidden');
-            try {{
-                const res = await fetch("/api/ai", {{
-                    method: "POST",
-                    headers: {{"Content-Type": "application/json"}},
-                    body: JSON.stringify({{prompt: prompt, content: selectedText}})
-                }});
+            try {
+                const res = await fetch(`/progress/${currentTaskId}`);
                 const data = await res.json();
-                if(data.result) {{
-                    if(window.getSelection().toString()) {{
-                        document.execCommand('insertText', false, data.result);
-                    }} else {{
-                        editor.innerHTML += `<div class='mt-6 p-6 bg-red-50 border-l-4 border-red-500 rounded-r-xl'>${{data.result}}</div>`;
-                    }}
-                    save();
-                }}
-            }} catch(e) {{ alert("Tiger AI error: " + e.message); }}
-            loading.classList.add('hidden');
-        }}
 
-        function exportPDF() {{
-            fetch("/word/pdf", {{
-                method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify({{html: editor.innerHTML}})
-            }}).then(r => r.blob()).then(b => {{
-                let a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = "Tiger_Doc.pdf"; a.click();
-            }});
-        }}
+                const bar = document.getElementById('progressBar');
+                const text = document.getElementById('progressPercent');
+                const statusText = document.getElementById('progressStatus');
+
+                if (data.percent) {
+                    const p = parseFloat(data.percent);
+                    bar.style.width = p + '%';
+                    text.innerText = Math.round(p) + '%';
+                }
+
+                if (data.status === 'finished') {
+                    bar.style.width = '100%';
+                    text.innerText = '100%';
+                    statusText.innerText = 'Download Complete!';
+                    clearInterval(progressInterval);
+                }
+            } catch (e) {
+                console.error("Progress error", e);
+            }
+        }
     </script>
 </body>
 </html>
-""")
+"""
 
-@app.route("/sheet")
-def sheet():
-    return render_template_string(f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Tiger Sheet - RED TIGER</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        .sheet-container {{ overflow: auto; height: calc(100vh - 125px); }}
-        table {{ border-collapse: collapse; }}
-        td, th {{ border: 1px solid #edf2f7; min-width: 130px; padding: 6px 12px; font-size: 13px; outline: none; }}
-        th {{ background: #fdfdfd; font-weight: 700; color: #4a5568; position: sticky; top: 0; z-index: 10; border-bottom: 2px solid #e2e8f0; }}
-        .row-idx {{ min-width: 50px; background: #fdfdfd; font-size: 10px; text-align: center; position: sticky; left: 0; z-index: 20; color: #a0aec0; }}
-        td:focus {{ border: 2px solid #e53e3e; background: #fff5f5; z-index: 5; }}
-    </style>
-</head>
-<body class="bg-gray-50">
-    {NAV_HTML}
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/info', methods=['POST'])
+def get_info():
+    data = request.json
+    url = data.get('url')
+    if not url: return jsonify({'error': 'No URL'}), 400
+
+    try:
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            task_id = info.get('id', 'task_' + str(os.urandom(4).hex()))
+            download_progress[task_id] = {'status': 'waiting', 'percent': '0'}
+            
+            return jsonify({
+                'task_id': task_id,
+                'title': info.get('title', 'Unknown Title'),
+                'thumbnail': info.get('thumbnail', ''),
+                'duration': f"{info.get('duration', 0) // 60}:{info.get('duration', 0) % 60:02d}"
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/progress/<task_id>')
+def get_progress(task_id):
+    progress = download_progress.get(task_id, {'status': 'not_found', 'percent': '0'})
+    return jsonify(progress)
+
+@app.route('/download', methods=['POST'])
+def download():
+    video_url = request.form.get('url')
+    task_id = request.form.get('task_id', 'unknown')
     
-    <div class="bg-white border-b border-gray-200 px-6 py-3 flex items-center gap-6 sticky top-16 z-40 shadow-sm">
-        <div class="flex items-center bg-gray-50 rounded-xl px-4 py-2 w-full max-w-xl border border-gray-100">
-            <span class="text-red-500 font-bold italic mr-3">fx</span>
-            <input id="formulaBar" type="text" placeholder="Select a cell to edit..." class="bg-transparent w-full outline-none text-sm font-medium">
-        </div>
-        
-        <div class="flex items-center gap-3 bg-gray-50 p-1.5 rounded-xl border border-gray-100">
-            <label class="text-[10px] uppercase font-bold text-gray-400 ml-1">Text Color</label>
-            <input type="color" id="sheetColorPicker" onchange="applyColor(this.value)" class="w-8 h-8 p-0 border-none cursor-pointer bg-transparent">
-        </div>
+    if not video_url: return "URL is missing", 400
 
-        <button onclick="exportPDF()" class="bg-red-600 text-white px-6 py-2 rounded-xl hover:bg-red-700 text-sm font-bold shadow-md shadow-red-100 transition whitespace-nowrap">Export PDF</button>
-    </div>
+    # প্রগ্রেস হুক ফাংশনটি এখানে ডিফাইন করা হয়েছে যাতে এটি task_id এক্সেস করতে পারে
+    def internal_hook(d):
+        if d['status'] == 'downloading':
+            p = d.get('_percent_str', '0%').replace('%', '').strip()
+            download_progress[task_id] = {'status': 'downloading', 'percent': p}
+        elif d['status'] == 'finished':
+            download_progress[task_id] = {'status': 'finished', 'percent': '100'}
 
-    <div class="sheet-container">
-        <table id="mainTable"></table>
-    </div>
+    temp_dir = tempfile.mkdtemp()
+    try:
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio', 
+            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+            'quiet': True,
+            'progress_hooks': [internal_hook],
+        }
 
-    <script>
-        const table = document.getElementById("mainTable");
-        const formulaBar = document.getElementById("formulaBar");
-        const colorPicker = document.getElementById("sheetColorPicker");
-        let activeCell = null;
-        const ROWS = 60, COLS = 26;
-        
-        let head = "<tr><th class='row-idx'>#</th>";
-        for(let c=0; c<COLS; c++) head += `<th>${{String.fromCharCode(65+c)}}</th>`;
-        table.innerHTML = head + "</tr>";
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            file_path = ydl.prepare_filename(info)
 
-        for(let r=1; r<=ROWS; r++) {{
-            let row = `<tr><td class="row-idx font-bold">${{r}}</td>`;
-            for(let c=0; c<COLS; c++) {{
-                const cellId = String.fromCharCode(65+c) + r;
-                const savedContent = localStorage.getItem('tiger_sheet_html_'+cellId) || "";
-                row += `<td contenteditable id="${{cellId}}" onfocus="handleFocus(this)" oninput="handleInput(this)" class="bg-white transition-colors">${{savedContent}}</td>`;
-            }}
-            table.innerHTML += row + "</tr>";
-        }}
-
-        function handleFocus(cell) {{
-            activeCell = cell;
-            formulaBar.value = cell.innerText;
-            const style = window.getComputedStyle(cell);
-            const rgb = style.color;
-            const hex = rgbToHex(rgb);
-            if(hex) colorPicker.value = hex;
-        }}
-
-        function handleInput(cell) {{
-            localStorage.setItem('tiger_sheet_html_'+cell.id, cell.innerHTML);
-            formulaBar.value = cell.innerText;
-        }}
-
-        function applyColor(color) {{
-            if(activeCell) {{
-                activeCell.style.color = color;
-                localStorage.setItem('tiger_sheet_html_'+activeCell.id, activeCell.innerHTML);
-            }}
-        }}
-
-        function rgbToHex(rgb) {{
-            const match = rgb.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
-            if (!match) return null;
-            const c = (x) => ("0" + parseInt(x).toString(16)).slice(-2);
-            return "#" + c(match[1]) + c(match[2]) + c(match[3]);
-        }}
-
-        function exportPDF() {{
-             const data = [];
-             document.querySelectorAll("tr").forEach((row, rIdx) => {{
-                 if(rIdx > 100) return; 
-                 const rData = [];
-                 row.querySelectorAll("th, td").forEach((cell, cIdx) => {{ 
-                     if(cIdx < 16) rData.push(cell.innerText); 
-                 }});
-                 data.push(rData);
-             }});
-             fetch("/sheet/pdf", {{
-                method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify({{data: data}})
-            }}).then(r => r.blob()).then(b => {{
-                let a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = "Tiger_Sheet.pdf"; a.click();
-            }});
-        }}
-    </script>
-</body>
-</html>
-""")
-
-@app.route("/word/pdf", methods=["POST"])
-def word_pdf():
-    html_data = request.json.get("html", "")
-    processed = html_data.replace('<div>', '<br/>').replace('</div>', '')
-    
-    def convert_span_color(match):
-        style = match.group(1)
-        color_match = re.search(r'color:\s*(#[0-9a-fA-F]+|rgb\(\d+,\s*\d+,\s*\d+\))', style)
-        if color_match:
-            return f'<font color="{color_match.group(1)}">'
-        return ''
-
-    processed = re.sub(r'<span style="([^"]+)">', convert_span_color, processed)
-    processed = processed.replace('</span>', '</font>')
-    processed = re.sub(r'<(?!br|p|b|i|u|font|strong|em)[^>]+>', '', processed)
-    
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
-    styles = getSampleStyleSheet()
-    p_style = ParagraphStyle('TigerStyle', parent=styles['Normal'], fontSize=12, leading=18, spaceAfter=12, alignment=0)
-    
-    content = []
-    paragraphs = processed.split('<br/>')
-    for p in paragraphs:
-        if p.strip():
-            try:
-                content.append(Paragraph(p, p_style))
-            except:
-                clean_p = re.sub('<[^<]+?>', '', p)
-                content.append(Paragraph(clean_p, p_style))
-        else:
-            content.append(Spacer(1, 0.1*inch))
-
-    doc.build(content)
-    buf.seek(0)
-    return send_file(buf, download_name="Tiger_Document.pdf", as_attachment=True)
-
-@app.route("/sheet/pdf", methods=["POST"])
-def sheet_pdf():
-    data = request.json.get("data", [])
-    if not data:
-        return jsonify({"error": "No data"}), 400
-
-    buf = io.BytesIO()
-    # Margins optimize kora hoyeche dynamic wrapping-er jonno
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), topMargin=30, bottomMargin=30, leftMargin=30, rightMargin=30)
-    
-    styles = getSampleStyleSheet()
-    # Cell text wrapping logic
-    cell_style = ParagraphStyle('CellWrap', parent=styles['Normal'], fontSize=8, leading=10, alignment=1)
-    header_style = ParagraphStyle('HeaderWrap', parent=styles['Normal'], fontSize=10, leading=12, alignment=1, textColor=colors.whitesmoke, fontName='Helvetica-Bold')
-
-    formatted_data = []
-    for r_idx, row in enumerate(data):
-        formatted_row = []
-        for cell in row:
-            if r_idx == 0:
-                formatted_row.append(Paragraph(str(cell), header_style))
+            if os.path.exists(file_path):
+                return send_file(
+                    file_path,
+                    as_attachment=True,
+                    download_name=os.path.basename(file_path)
+                )
             else:
-                formatted_row.append(Paragraph(str(cell), cell_style))
-        formatted_data.append(formatted_row)
+                return "Error generating file", 500
 
-    num_cols = len(data[0]) if data else 1
-    # Landscape A4 width ~11.69 inch. Margins bad diye ~10.6 inch usable space.
-    col_width = (10.6 * inch) / num_cols
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
-    table = Table(formatted_data, colWidths=[col_width] * num_cols)
-    
-    style = TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#e53e3e")), # Red Tiger Header
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#fff5f5")]),
-        ('LEFTPADDING', (0, 0), (-1, -1), 4),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-    ])
-    table.setStyle(style)
-    
-    doc.build([table])
-    buf.seek(0)
-    return send_file(buf, download_name="Tiger_Sheet.pdf", as_attachment=True)
-
-if __name__ == "__main__":
-    app.run(debug=True)
+if __name__ == '__main__':
+    # threaded=True অত্যন্ত গুরুত্বপূর্ণ যাতে ডাউনলোড চলাকালীন প্রগ্রেস API কল করা যায়
+    app.run(debug=True, port=5000, threaded=True)
